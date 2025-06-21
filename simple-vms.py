@@ -7,27 +7,35 @@ import time
 from cryptography.fernet import Fernet
 from PIL import Image, ImageTk
 import json
-import webbrowser # برای باز کردن لینک در مرورگر
+import webbrowser
+from onvif import ONVIFCamera
+from urllib.parse import urlparse
+import traceback
+import sys
 
 # کلید ثابت برای رمزنگاری
 ENCRYPTION_KEY = b'pRmgMa8T0INjEAfksaq2aafzoZXEuwKIyAd7eDZnpG8='
 cipher_suite = Fernet(ENCRYPTION_KEY)
 SETTINGS_FILE = "app_settings.enc"
-THEME_FILE = "sun-valley.tcl" # نام فایل پوسته
 
 class RTSPViewerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Simple CCTV Viewer") # عنوان پنجره اصلی بدون متن اضافی
+        self.root.title("Simple cctv viewer")
         self.root.geometry("{0}x{1}+0+0".format(root.winfo_screenwidth(), root.winfo_screenheight()))
         self.root.state('zoomed')
 
+        # مقادیر پیش‌فرض تنظیمات با فیلدهای جدید برای RTSP
         self.settings = {
-            "rtsp_url": "rtsp://example.com/live",
+            "ip": "192.168.1.10",
+            "port": "554",
+            "username": "admin",
+            "password": "",
+            "rtsp_path": "cam/realmonitor?channel=1&subtype=0",
+            "rtsp_url": "",  # این فیلد توسط برنامه ساخته می‌شود
             "save_path": os.path.join(os.path.expanduser("~"), "RTSP_Recordings"),
             "video_filename": "recording_{timestamp}.avi",
             "image_filename": "screenshot_{timestamp}.png",
-            "theme": "dark"  # پوسته پیش‌فرض
         }
 
         self.recording = False
@@ -47,96 +55,86 @@ class RTSPViewerApp:
         self.frame_rate = 30  
         
         self._tooltip_after_id = None
-        self.theme_var = tk.StringVar(value=self.settings.get("theme", "dark"))
 
+        # اعمال استایل برای خوانا شدن Tooltip
+        style = ttk.Style(self.root)
+        style.configure("Tooltip.TLabel", padding=(10, 5), relief="solid", borderwidth=1)
 
-        self.create_widgets() # ویجت‌ها از جمله theme_combo در اینجا ایجاد می‌شوند
-        self.root.bind("<Map>", self.on_window_restore)
+        self.create_widgets()
         
-        self.video_label_width = 1 
-        self.video_label_height = 1
-        if hasattr(self, 'video_label'):
-            self.video_label.bind("<Configure>", self.on_video_label_resize)
+        # --- اصلاحیه کلیدی ---
+        # برنامه را مجبور می‌کنیم تا ابعاد ویجت‌ها را قبل از شروع استریم محاسبه کند
+        self.root.update_idletasks()
+        self.video_label_width = self.video_label.winfo_width()
+        self.video_label_height = self.video_label.winfo_height()
+        
+        self.root.bind("<Map>", self.on_window_restore)
+        self.video_label.bind("<Configure>", self.on_video_label_resize)
 
-        self.load_settings() # این متد پوسته ذخیره شده را بارگیری و اعمال می‌کند
+        self.load_settings()
 
     def on_video_label_resize(self, event):
         self.video_label_width = event.width
         self.video_label_height = event.height
-
-    def apply_theme(self, theme_name):
-        """پوسته انتخاب شده را اعمال می‌کند."""
-        try:
-            if theme_name not in ["light", "dark"]:
-                theme_name = "dark" # بازگشت به حالت پیش‌فرض در صورت نامعتبر بودن
-            
-            theme_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), THEME_FILE)
-            if os.path.exists(theme_file_path):
-                self.root.tk.call("set_theme", theme_name)
-                self.settings["theme"] = theme_name # به‌روزرسانی تنظیمات داخلی
-                if hasattr(self, 'status_var') and self.root.winfo_exists(): # بررسی وجود status_var
-                     self.status_var.set(f"پوسته به {theme_name} تغییر یافت.")
-            else:
-                if hasattr(self, 'status_var') and self.root.winfo_exists():
-                    self.status_var.set(f"فایل پوسته '{THEME_FILE}' یافت نشد.")
-                print(f"فایل پوسته '{THEME_FILE}' در مسیر '{theme_file_path}' یافت نشد.")
-        except tk.TclError as e:
-            print(f"خطا در اعمال پوسته {theme_name}: {e}")
-            if hasattr(self, 'status_var') and self.root.winfo_exists():
-                self.status_var.set(f"خطا در اعمال پوسته: {theme_name}")
-        except Exception as e_gen:
-            print(f"خطای ناشناخته در اعمال پوسته {theme_name}: {e_gen}")
-
-
-    def on_theme_change(self, event=None):
-        """زمانی که کاربر پوسته را از کمبوباکس تغییر می‌دهد فراخوانی می‌شود."""
-        new_theme = self.theme_var.get()
-        self.apply_theme(new_theme)
-        # self.settings["theme"] = new_theme # اطمینان از اینکه تنظیمات برای ذخیره‌سازی به‌روز است
-                                         # save_settings این کار را با خواندن از theme_var انجام می‌دهد
-
+        
     def create_widgets(self):
+        # هدر اصلی دیگر دکمه‌ای ندارد
         header = ttk.Frame(self.root, padding=10)
         header.pack(fill=tk.X)
-        # title_label حذف شد
-        toolbar = ttk.Frame(header)
-        toolbar.pack(side=tk.RIGHT) # چیدمان تولبار در سمت راست هدر
         
-        # برای اینکه دکمه‌ها در مرکز هدر قرار گیرند، می‌توانیم هدر را به چند ستون تقسیم کنیم
-        # یا از یک فریم دیگر در مرکز استفاده کنیم. فعلا ساده نگه می‌داریم.
-        # header.columnconfigure(0, weight=1) # ستون خالی سمت چپ
-        # header.columnconfigure(1, weight=0) # ستون برای تولبار
-        # header.columnconfigure(2, weight=1) # ستون خالی سمت راست
-        # toolbar.grid(row=0, column=1) # قرار دادن تولبار در ستون وسطی
-
-
-        self.record_btn = ttk.Button(toolbar, text="شروع ضبط", command=self.toggle_recording)
-        self.record_btn.pack(side=tk.LEFT, padx=5)
-        self.snapshot_btn = ttk.Button(toolbar, text="ذخیره تصویر", command=self.take_snapshot)
-        self.snapshot_btn.pack(side=tk.LEFT, padx=5)
-
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
+        # --- تب نمایش زنده (تغییر یافته) ---
         self.video_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.video_tab, text="نمایش زنده")
-        self.video_label = ttk.Label(self.video_tab) 
-        self.video_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # فریم اصلی برای ویدئو که در مرکز قرار می‌گیرد
+        video_main_frame = ttk.Frame(self.video_tab)
+        video_main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)  # اضافه کردن padding برای فضای بیشتر
+        video_main_frame.grid_rowconfigure(0, weight=1)
+        video_main_frame.grid_columnconfigure(0, weight=1)
 
+        # تغییر به tk.Label برای کنترل بهتر اندازه تصویر
+        self.video_label = tk.Label(video_main_frame, bg='black', bd=0) 
+        self.video_label.grid(row=0, column=0, sticky="nsew")  # تغییر برای پر کردن فضای موجود
+
+        # ایجاد تصویر اولیه با اندازه مناسب
+        placeholder = Image.new('RGB', (800, 600), (0, 0, 0))
+        self.placeholder_img = ImageTk.PhotoImage(placeholder)
+        self.video_label.config(image=self.placeholder_img)
+        self.video_label.image = self.placeholder_img  # نگه داشتن رفرنس
+
+        # فریم برای دکمه‌های زیر ویدئو
+        video_controls_frame = ttk.Frame(self.video_tab)
+        video_controls_frame.pack(fill=tk.X, pady=10)
+        
+        # دکمه‌ها در یک فریم داخلی دیگر برای وسط‌چین شدن
+        buttons_inner_frame = ttk.Frame(video_controls_frame)
+        buttons_inner_frame.pack()
+
+        self.record_btn = ttk.Button(buttons_inner_frame, text="شروع ضبط", command=self.toggle_recording)
+        self.record_btn.pack(side=tk.LEFT, padx=5)
+        self.snapshot_btn = ttk.Button(buttons_inner_frame, text="ذخیره تصویر", command=self.take_snapshot)
+        self.snapshot_btn.pack(side=tk.LEFT, padx=5)
+
+        # --- تب تنظیمات ---
         self.settings_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.settings_tab, text="تنظیمات")
-        self.create_settings_form() # theme_var باید قبل از این تعریف شده باشد
+        self.create_settings_form()
 
+        # --- تب درباره من ---
         self.setup_about_tab()
 
         self.status_var = tk.StringVar(value="آماده")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
+        
+        # Tooltip با استایل جدید برای خوانایی
         self.tooltip_var = tk.StringVar()
         self.tooltip_label = ttk.Label(
-            self.root, textvariable=self.tooltip_var, background="#ffffe0",
-            relief="solid", borderwidth=1, padding=(10, 5)
+            self.root, textvariable=self.tooltip_var,
+            style="Tooltip.TLabel"  # استفاده از استایل تعریف شده
         )
         self.tooltip_label.place_forget()
 
@@ -147,87 +145,289 @@ class RTSPViewerApp:
         frame.columnconfigure(0, weight=1) 
         row_idx = 0
 
-        name_label = ttk.Label(frame, text="من علی عباسپور هستم", font=("Arial", 14, "bold"), anchor="e", justify=tk.RIGHT)
-        name_label.grid(row=row_idx, column=0, pady=(10, 5), sticky='ew')
+        # Header
+        name_label = ttk.Label(
+            frame, 
+            text="I'm Ali Abbaspor", 
+            font=("Arial", 14, "bold"),
+            anchor="center"
+        )
+        name_label.grid(row=row_idx, column=0, pady=(0, 15), sticky="ew")
         row_idx += 1
 
-        desc_text = "تبدیل دوربین‌ مداربسته به ابزارهای خلاقانه. من به شما کمک می‌کنم تا با نرم افزارهای تخصصی، با تصویر دوربین مداربسته کارهای خارق العاده ای انجام دهید و از دوربین‌ خود بیشترین بهره را ببرید."
-        desc_label = ttk.Label(frame, text=desc_text, wraplength=self.root.winfo_width() // 2, justify=tk.RIGHT, anchor="e")
-        desc_label.grid(row=row_idx, column=0, pady=5, sticky='ew')
+        # Bio text
+        bio_text = (
+            "I transform surveillance cameras into creative tools. With over 15 years of experience "
+            "in video analytics and CCTV software development, I help you maximize your camera's potential. "
+            "My specialty is developing custom software that turns ordinary surveillance systems into "
+            "intelligent solutions for retail analytics, safety monitoring, and behavioral studies."
+        )
+        bio_label = ttk.Label(
+            frame, 
+            text=bio_text,
+            wraplength=600,
+            justify="center",
+            font=("Arial", 10)
+        )
+        bio_label.grid(row=row_idx, column=0, pady=5, sticky="ew")
         row_idx += 1
-        
-        def rewrap_desc(event):
-            new_wraplength = event.width - 40 
-            if new_wraplength > 0 :
-                 desc_label.config(wraplength=new_wraplength)
-        frame.bind("<Configure>", rewrap_desc)
 
+        # Key capabilities
+        capabilities = [
+            "• Real-time object detection and tracking",
+            "• Cross-camera people counting solutions",
+            "• Custom ANPR (Automatic Number Plate Recognition)",
+            "• AI-powered retail analytics",
+            "• Behavior analysis through motion patterns"
+        ]
+        capa_label = ttk.Label(
+            frame, 
+            text="\n".join(capabilities),
+            justify="center",
+            padding=(10, 15)
+        )
+        capa_label.grid(row=row_idx, column=0, sticky="ew")
+        row_idx += 1
+
+        # Philosophy
+        philosophy = (
+            "I believe security cameras should go beyond surveillance. My mission is to transform "
+            "passive recording devices into active business intelligence tools that generate insights "
+            "and automate decisions."
+        )
+        phi_label = ttk.Label(
+            frame, 
+            text=philosophy,
+            wraplength=550,
+            font=("Arial", 9, "italic"),
+            justify="center",
+            foreground="#555555"
+        )
+        phi_label.grid(row=row_idx, column=0, pady=(10, 15), sticky="ew")
+        row_idx += 1
+
+        # Website link
         link_url = "https://intellsoft.ir"
-        link_label = ttk.Label(frame, text=link_url, foreground="blue", cursor="hand2", anchor="e", justify=tk.RIGHT)
-        link_label.grid(row=row_idx, column=0, pady=(10, 5), sticky='ew')
+        link_label = ttk.Label(
+            frame, 
+            text=link_url, 
+            foreground="blue", 
+            cursor="hand2", 
+            font=("Arial", 9, "underline")
+        )
+        link_label.grid(row=row_idx, column=0, pady=(10, 5))
         link_label.bind("<Button-1>", lambda e, url=link_url: self.open_link(url))
         row_idx += 1
+
+        # Dynamic resizing
+        def rewrap_desc(event):
+            new_wraplength = event.width - 40 
+            if new_wraplength > 0:
+                bio_label.config(wraplength=new_wraplength)
+                phi_label.config(wraplength=new_wraplength)
+        frame.bind("<Configure>", rewrap_desc)
 
     def open_link(self, url):
         try:
             webbrowser.open_new(url)
         except Exception as e:
-            messagebox.showerror("خطا", f"امکان باز کردن لینک وجود نداشت: {e}", parent=self.root)
+            messagebox.showerror("Error", f"Could not open link: {e}", parent=self.root)
 
     def create_settings_form(self):
         form_frame = ttk.Frame(self.settings_tab, padding=20)
         form_frame.pack(fill=tk.BOTH, expand=True)
+        form_frame.columnconfigure(1, weight=1)
+
+        # --- بخش جدید تنظیمات RTSP ---
+        rtsp_group = ttk.LabelFrame(form_frame, text="اطلاعات اتصال RTSP", padding=15)
+        rtsp_group.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 20))
+        rtsp_group.columnconfigure(1, weight=1)
         
-        # RTSP Link
-        rtsp_frame = ttk.Frame(form_frame)
-        rtsp_frame.pack(fill=tk.X, pady=5)
-        rtsp_frame.columnconfigure(1, weight=1)
-        ttk.Label(rtsp_frame, text="لینک RTSP:").grid(row=0, column=0, padx=(0, 10), sticky="w")
-        self.rtsp_entry = ttk.Entry(rtsp_frame, width=60)
-        self.rtsp_entry.grid(row=0, column=1, sticky="ew")
+        # IP
+        ttk.Label(rtsp_group, text="آی پی دوربین:").grid(row=0, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.ip_entry = ttk.Entry(rtsp_group)
+        self.ip_entry.grid(row=0, column=1, sticky="ew")
+        self.ip_entry.bind("<KeyRelease>", self._update_constructed_url_display)
+        
+        # Port
+        ttk.Label(rtsp_group, text="پورت RTSP:").grid(row=1, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.port_entry = ttk.Entry(rtsp_group)
+        self.port_entry.grid(row=1, column=1, sticky="ew")
+        self.port_entry.bind("<KeyRelease>", self._update_constructed_url_display)
+        
+        # Username
+        ttk.Label(rtsp_group, text="نام کاربری:").grid(row=2, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.user_entry = ttk.Entry(rtsp_group)
+        self.user_entry.grid(row=2, column=1, sticky="ew")
+        self.user_entry.bind("<KeyRelease>", self._update_constructed_url_display)
+        
+        # Password
+        ttk.Label(rtsp_group, text="رمز عبور:").grid(row=3, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.pass_entry = ttk.Entry(rtsp_group, show="*")
+        self.pass_entry.grid(row=3, column=1, sticky="ew")
+        self.pass_entry.bind("<KeyRelease>", self._update_constructed_url_display)
+        
+        # RTSP Path
+        ttk.Label(rtsp_group, text="مسیر RTSP:").grid(row=4, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.rtsp_path_entry = ttk.Entry(rtsp_group)
+        self.rtsp_path_entry.grid(row=4, column=1, sticky="ew")
+        self.rtsp_path_entry.bind("<KeyRelease>", self._update_constructed_url_display)
+        
+        # دکمه کشف خودکار آدرس RTSP
+        self.discover_btn = ttk.Button(rtsp_group, text="کشف خودکار آدرس RTSP", command=self.discover_rtsp_url)
+        self.discover_btn.grid(row=4, column=2, padx=(5, 0))
+        
+        # Constructed URL (Read-only)
+        ttk.Label(rtsp_group, text="لینک نهایی:").grid(row=5, column=0, padx=(0, 10), pady=(15, 5), sticky="w")
+        self.constructed_url_entry = ttk.Entry(rtsp_group, state="readonly")
+        self.constructed_url_entry.grid(row=5, column=1, columnspan=2, sticky="ew", pady=(15, 5))
+
+
+        # --- سایر تنظیمات ---
+        other_group = ttk.LabelFrame(form_frame, text="تنظیمات ذخیره‌سازی", padding=15)
+        other_group.grid(row=1, column=0, columnspan=2, sticky='ew')
+        other_group.columnconfigure(1, weight=1)
         
         # Save Path
-        path_frame = ttk.Frame(form_frame)
-        path_frame.pack(fill=tk.X, pady=5)
-        path_frame.columnconfigure(1, weight=1)
-        ttk.Label(path_frame, text="مسیر ذخیره‌سازی:").grid(row=0, column=0, padx=(0, 10), sticky="w")
-        self.path_entry = ttk.Entry(path_frame, width=50)
+        ttk.Label(other_group, text="مسیر ذخیره‌سازی:").grid(row=0, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.path_entry = ttk.Entry(other_group, width=50)
         self.path_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Button(path_frame, text="مرور...", command=self.browse_save_path).grid(row=0, column=2, padx=(10, 0))
+        ttk.Button(other_group, text="مرور...", command=self.browse_save_path).grid(row=0, column=2, padx=(5, 0))
         
         # Video Filename
-        video_frame = ttk.Frame(form_frame)
-        video_frame.pack(fill=tk.X, pady=5)
-        video_frame.columnconfigure(1, weight=1)
-        ttk.Label(video_frame, text="قالب نام فایل ویدئو:").grid(row=0, column=0, padx=(0, 10), sticky="w")
-        self.video_entry = ttk.Entry(video_frame, width=30)
-        self.video_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Label(video_frame, text="(از {timestamp} برای زمان‌مهر استفاده کنید)").grid(row=0, column=2, padx=(10, 0), sticky="w")
+        ttk.Label(other_group, text="قالب نام فایل ویدئو:").grid(row=1, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.video_entry = ttk.Entry(other_group)
+        self.video_entry.grid(row=1, column=1, columnspan=2, sticky="ew")
         
         # Image Filename
-        image_frame = ttk.Frame(form_frame)
-        image_frame.pack(fill=tk.X, pady=5)
-        image_frame.columnconfigure(1, weight=1)
-        ttk.Label(image_frame, text="قالب نام فایل تصویر:").grid(row=0, column=0, padx=(0, 10), sticky="w")
-        self.image_entry = ttk.Entry(image_frame, width=30)
-        self.image_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Label(image_frame, text="(از {timestamp} برای زمان‌مهر استفاده کنید)").grid(row=0, column=2, padx=(10, 0), sticky="w")
-
-        # Theme Selection
-        theme_settings_frame = ttk.Frame(form_frame)
-        theme_settings_frame.pack(fill=tk.X, pady=5)
-        theme_settings_frame.columnconfigure(1, weight=1)
-        ttk.Label(theme_settings_frame, text="پوسته برنامه:").grid(row=0, column=0, padx=(0, 10), sticky="w")
-        # self.theme_var is already initialized in __init__
-        self.theme_combo = ttk.Combobox(theme_settings_frame, textvariable=self.theme_var, values=["dark", "light"], state="readonly", width=27)
-        self.theme_combo.grid(row=0, column=1, sticky="ew")
-        self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_change)
+        ttk.Label(other_group, text="قالب نام فایل تصویر:").grid(row=2, column=0, padx=(0, 10), pady=5, sticky="w")
+        self.image_entry = ttk.Entry(other_group)
+        self.image_entry.grid(row=2, column=1, columnspan=2, sticky="ew")
         
         # Buttons Frame
         btn_frame = ttk.Frame(form_frame)
-        btn_frame.pack(fill=tk.X, pady=20)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky='e', pady=20)
         ttk.Button(btn_frame, text="ذخیره تنظیمات", command=self.save_settings).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="بازنشانی", command=self.reset_settings).pack(side=tk.RIGHT, padx=5)
+
+    def discover_rtsp_url(self):
+        """کشف خودکار آدرس RTSP با استفاده از پروتکل ONVIF"""
+        ip = self.ip_entry.get()
+        port = self.port_entry.get()
+        username = self.user_entry.get()
+        password = self.pass_entry.get()
+        
+        if not ip:
+            self.show_tooltip("لطفاً آدرس IP دوربین را وارد کنید")
+            return
+            
+        # استفاده از پورت پیش‌فرض ONVIF (80)
+        onvif_port = 80
+        
+        try:
+            # ایجاد اتصال به دوربین با استفاده از ONVIF
+            self.status_var.set("در حال اتصال به دوربین از طریق ONVIF...")
+            self.discover_btn.config(state=tk.DISABLED, text="در حال کشف...")
+            
+            # اجرای عملیات کشف در یک thread جداگانه
+            threading.Thread(target=self._perform_onvif_discovery, 
+                             args=(ip, onvif_port, username, password),
+                             daemon=True).start()
+            
+        except Exception as e:
+            error_msg = f"خطا در کشف آدرس: {str(e)}"
+            self.status_var.set(error_msg)
+            self.show_tooltip(error_msg)
+            self.discover_btn.config(state=tk.NORMAL, text="کشف خودکار آدرس RTSP")
+            print(f"ONVIF discovery error: {traceback.format_exc()}")
+
+    def _perform_onvif_discovery(self, ip, port, username, password):
+        """انجام عملیات کشف آدرس RTSP در یک thread جداگانه"""
+        try:
+            # ایجاد اتصال به دوربین با پورت ONVIF ثابت (80)
+            camera = ONVIFCamera(ip, port, username, password)
+            
+            # دریافت سرویس مدیا
+            media_service = camera.create_media_service()
+            
+            # دریافت پروفایل‌ها
+            profiles = media_service.GetProfiles()
+            
+            if not profiles:
+                self.root.after(0, lambda: self.status_var.set("هیچ پروفایلی یافت نشد"))
+                self.root.after(0, lambda: self.show_tooltip("دوربین هیچ پروفایل ویدئویی ندارد"))
+                return
+                
+            # استفاده از اولین پروفایل
+            profile_token = profiles[0].token
+            
+            # دریافت آدرس استریم
+            stream_uri = media_service.GetStreamUri({
+                'StreamSetup': {'Stream': 'RTP-Unicast', 'Transport': 'RTSP'},
+                'ProfileToken': profile_token
+            })
+            
+            # تجزیه آدرس RTSP
+            rtsp_url = stream_uri.Uri
+            parsed = urlparse(rtsp_url)
+            
+            # استخراج مسیر RTSP (بدون پارامترهای احراز هویت)
+            rtsp_path = parsed.path
+            if rtsp_path.startswith('/'):
+                rtsp_path = rtsp_path[1:]
+                
+            # اضافه کردن کوئری استرینگ اگر وجود داشته باشد
+            if parsed.query:
+                rtsp_path += '?' + parsed.query
+                
+            # به‌روزرسانی رابط کاربری در thread اصلی
+            self.root.after(0, lambda: self._update_rtsp_path(rtsp_path))
+            self.root.after(0, lambda: self.status_var.set("آدرس RTSP با موفقیت کشف شد"))
+            self.root.after(0, lambda: self.show_tooltip(f"آدرس کشف شده: {rtsp_path}"))
+            
+        except Exception as e:
+            error_msg = f"خطا در کشف آدرس: {str(e)}"
+            self.root.after(0, lambda: self.status_var.set(error_msg))
+            self.root.after(0, lambda: self.show_tooltip(error_msg))
+            print(f"ONVIF discovery error: {traceback.format_exc()}")
+        finally:
+            self.root.after(0, lambda: self.discover_btn.config(state=tk.NORMAL, text="کشف خودکار آدرس RTSP"))
+
+    def _update_rtsp_path(self, rtsp_path):
+        """به‌روزرسانی فیلد مسیر RTSP با مقدار کشف شده"""
+        self.rtsp_path_entry.delete(0, tk.END)
+        self.rtsp_path_entry.insert(0, rtsp_path)
+        self._update_constructed_url_display()
+
+    def _build_rtsp_url(self):
+        """لینک RTSP را از فیلدهای ورودی می‌سازد."""
+        ip = self.ip_entry.get()
+        port = self.port_entry.get()
+        user = self.user_entry.get()
+        password = self.pass_entry.get()
+        path = self.rtsp_path_entry.get()
+
+        auth_part = ""
+        if user:
+            auth_part = f"{user}:{password}@"
+        
+        port_part = ""
+        if port:
+            port_part = f":{port}"
+
+        # حذف اسلش اضافی در ابتدای مسیر اگر وجود داشته باشد
+        if path.startswith('/'):
+            path = path[1:]
+            
+        return f"rtsp://{auth_part}{ip}{port_part}/{path}"
+
+    def _update_constructed_url_display(self, event=None):
+        """فیلد نمایش لینک ساخته شده را به‌روز می‌کند."""
+        url = self._build_rtsp_url()
+        self.constructed_url_entry.config(state="normal")
+        self.constructed_url_entry.delete(0, tk.END)
+        self.constructed_url_entry.insert(0, url)
+        self.constructed_url_entry.config(state="readonly")
 
     def browse_save_path(self):
         path = filedialog.askdirectory(parent=self.root)
@@ -243,7 +443,6 @@ class RTSPViewerApp:
                     encrypted_data = f.read()
                 decrypted_data = cipher_suite.decrypt(encrypted_data)
                 loaded_settings_data = json.loads(decrypted_data.decode())
-                # Merge loaded settings with defaults, giving precedence to loaded ones
                 for key, value in loaded_settings_data.items():
                     self.settings[key] = value
                 loaded_successfully = True
@@ -251,20 +450,21 @@ class RTSPViewerApp:
                 if self.root.winfo_exists():
                     self.status_var.set(f"خطا در بارگیری تنظیمات: {str(e)}. استفاده از پیش‌فرض‌ها.")
         
-        # Populate UI elements from self.settings
-        self.rtsp_entry.delete(0, tk.END)
-        self.rtsp_entry.insert(0, self.settings.get("rtsp_url", "rtsp://example.com/live"))
+        # Populate UI elements
+        self.ip_entry.delete(0, tk.END); self.ip_entry.insert(0, self.settings.get("ip", "192.168.1.10"))
+        self.port_entry.delete(0, tk.END); self.port_entry.insert(0, self.settings.get("port", "554"))
+        self.user_entry.delete(0, tk.END); self.user_entry.insert(0, self.settings.get("username", "admin"))
+        self.pass_entry.delete(0, tk.END); self.pass_entry.insert(0, self.settings.get("password", ""))
+        self.rtsp_path_entry.delete(0, tk.END); self.rtsp_path_entry.insert(0, self.settings.get("rtsp_path", "cam/realmonitor?channel=1&subtype=0"))
+        
         self.path_entry.delete(0, tk.END)
         self.path_entry.insert(0, self.settings.get("save_path", os.path.join(os.path.expanduser("~"), "RTSP_Recordings")))
         self.video_entry.delete(0, tk.END)
         self.video_entry.insert(0, self.settings.get("video_filename", "recording_{timestamp}.avi"))
         self.image_entry.delete(0, tk.END)
         self.image_entry.insert(0, self.settings.get("image_filename", "screenshot_{timestamp}.png"))
-
-        # Load and apply theme
-        loaded_theme = self.settings.get("theme", "dark") # Default to dark if not in settings
-        self.theme_var.set(loaded_theme) # Update combobox variable
-        self.apply_theme(loaded_theme) # Apply the theme
+        
+        self._update_constructed_url_display() # نمایش لینک ساخته شده اولیه
 
         try:
             save_path_val = self.settings.get("save_path")
@@ -273,27 +473,32 @@ class RTSPViewerApp:
         except Exception as e_dir:
             if self.root.winfo_exists():
                 self.status_var.set(f"خطا در ایجاد پوشه ذخیره‌سازی: {str(e_dir)}")
-                self.show_tooltip(f"خطا در ایجاد پوشه: {self.settings.get('save_path')}")
-
+        
         if loaded_successfully and self.root.winfo_exists():
             self.status_var.set("تنظیمات بارگیری شد")
         
-        self.start_stream() # Start stream after settings are loaded
+        self.settings["rtsp_url"] = self._build_rtsp_url() # ساخت لینک برای اولین اجرا
+        self.start_stream()
 
     def save_settings(self):
         current_rtsp_url = self.settings.get("rtsp_url")
         
-        # Update self.settings directly from UI elements before saving
-        self.settings["rtsp_url"] = self.rtsp_entry.get()
+        # Update self.settings from UI
+        self.settings["ip"] = self.ip_entry.get()
+        self.settings["port"] = self.port_entry.get()
+        self.settings["username"] = self.user_entry.get()
+        self.settings["password"] = self.pass_entry.get()
+        self.settings["rtsp_path"] = self.rtsp_path_entry.get()
+        self.settings["rtsp_url"] = self._build_rtsp_url() # ساخت لینک جدید
+        self._update_constructed_url_display() # به‌روزرسانی نمایشگر لینک
+        
         self.settings["save_path"] = self.path_entry.get()
         self.settings["video_filename"] = self.video_entry.get()
         self.settings["image_filename"] = self.image_entry.get()
-        self.settings["theme"] = self.theme_var.get() # Get theme from combobox
 
         try:
-            save_path_val = self.settings["save_path"]
-            if save_path_val and not os.path.exists(save_path_val):
-                os.makedirs(save_path_val)
+            if self.settings["save_path"] and not os.path.exists(self.settings["save_path"]):
+                os.makedirs(self.settings["save_path"])
             
             json_data = json.dumps(self.settings).encode()
             encrypted_data = cipher_suite.encrypt(json_data)
@@ -304,133 +509,89 @@ class RTSPViewerApp:
                 self.status_var.set("تنظیمات با موفقیت ذخیره شد")
                 self.show_tooltip("تنظیمات با موفقیت ذخیره شد")
             
-            # Apply theme if it was changed through combobox and then saved
-            # self.apply_theme(self.settings["theme"]) # Already applied by on_theme_change
-
             capture_is_alive = self.capture_thread and self.capture_thread.is_alive()
             if current_rtsp_url != self.settings["rtsp_url"] or not capture_is_alive:
                 self.start_stream()
         except Exception as e:
             if self.root.winfo_exists():
                 self.status_var.set(f"خطا در ذخیره تنظیمات: {str(e)}")
-                self.show_tooltip(f"خطا در ذخیره تنظیمات: {str(e)}")
 
     def reset_settings(self):
-        # Reset to default values
         default_save_path = os.path.join(os.path.expanduser("~"), "RTSP_Recordings")
         self.settings = {
-            "rtsp_url": "rtsp://example.com/live",
+            "ip": "192.168.1.10", "port": "554", "username": "admin", "password": "", 
+            "rtsp_path": "cam/realmonitor?channel=1&subtype=0", "rtsp_url": "",
             "save_path": default_save_path,
             "video_filename": "recording_{timestamp}.avi",
             "image_filename": "screenshot_{timestamp}.png",
-            "theme": "dark" 
         }
         
         # Update UI elements
-        self.rtsp_entry.delete(0, tk.END)
-        self.rtsp_entry.insert(0, self.settings["rtsp_url"])
-        self.path_entry.delete(0, tk.END)
-        self.path_entry.insert(0, self.settings["save_path"])
-        self.video_entry.delete(0, tk.END)
-        self.video_entry.insert(0, self.settings["video_filename"])
-        self.image_entry.delete(0, tk.END)
-        self.image_entry.insert(0, self.settings["image_filename"])
-        self.theme_var.set(self.settings["theme"])
-        
-        self.apply_theme(self.settings["theme"]) # Apply the default theme
-        self.save_settings() # Save reset settings and potentially restart stream
+        self.load_settings() # ساده‌ترین راه برای بازنشانی UI و ساخت URL
+        self.save_settings() # ذخیره تنظیمات بازنشانی شده
 
     def _capture_frames_thread(self):
         cap = None
-        # Fetch rtsp_url from self.settings at the start of each connection attempt
-        # to ensure it's up-to-date if changed via settings tab.
-        
         while not self.capture_stop_event.is_set():
-            current_rtsp_url = self.settings.get("rtsp_url", "") # Get latest URL
-
+            current_rtsp_url = self.settings.get("rtsp_url", "")
             if cap is None or not cap.isOpened():
                 if self.root.winfo_exists():
                     self.root.after(0, lambda url=current_rtsp_url: self.status_var.set(f"درحال اتصال به {url}..."))
                 try:
                     if cap: cap.release()
-                    cap = cv2.VideoCapture(current_rtsp_url) # Use the latest URL
+                    cap = cv2.VideoCapture(current_rtsp_url)
                     if not cap.isOpened():
                         if cap: cap.release()
                         cap = None
                         if self.root.winfo_exists():
-                            self.root.after(0, lambda url=current_rtsp_url: self.status_var.set(f"اتصال به {url} ناموفق بود. تلاش مجدد طی 5 ثانیه..."))
-                        for _ in range(50): # 5 seconds
-                            if self.capture_stop_event.is_set(): break
-                            time.sleep(0.1)
-                        if self.capture_stop_event.is_set(): break
+                            self.root.after(0, lambda url=current_rtsp_url: self.status_var.set(f"اتصال به {url} ناموفق بود. تلاش مجدد..."))
+                        time.sleep(5)
                         continue
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 5)
-                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     fps_cap = cap.get(cv2.CAP_PROP_FPS)
                     self.frame_rate = int(fps_cap if fps_cap and fps_cap > 0 else 30)
                     if self.root.winfo_exists():
                         self.root.after(0, lambda w=width, h=height, fr=self.frame_rate: self.status_var.set(f"متصل شد. ({w}x{h} @ {fr}fps)"))
                 except Exception as e:
-                    if cap: cap.release()
-                    cap = None
-                    if self.root.winfo_exists():
-                        self.root.after(0, lambda err=str(e): self.status_var.set(f"خطا در اتصال: {err}. تلاش مجدد..."))
-                    for _ in range(50): # 5 seconds
-                        if self.capture_stop_event.is_set(): break
-                        time.sleep(0.1)
-                    if self.capture_stop_event.is_set(): break
+                    if cap: cap.release(); cap = None
+                    if self.root.winfo_exists(): self.root.after(0, lambda err=str(e): self.status_var.set(f"خطا در اتصال: {err}. تلاش مجدد..."))
+                    time.sleep(5)
                     continue
             if cap and cap.isOpened():
                 ret, frame = cap.read()
                 if self.capture_stop_event.is_set(): break
                 if ret and frame is not None and frame.size > 0:
-                    with self.frame_lock:
-                        self.latest_raw_frame = frame
+                    with self.frame_lock: self.latest_raw_frame = frame
                 elif not ret: 
-                    if self.root.winfo_exists():
-                         self.root.after(0, self.status_var.set("خطا در دریافت فریم یا پایان استریم. تلاش برای اتصال مجدد..."))
-                    if cap: cap.release()
-                    cap = None
+                    if self.root.winfo_exists(): self.root.after(0, self.status_var.set("خطا در دریافت فریم. اتصال مجدد..."))
+                    if cap: cap.release(); cap = None
                     time.sleep(0.5) 
             else: 
-                if cap: cap.release()
-                cap = None
+                if cap: cap.release(); cap = None
                 time.sleep(1) 
         if cap: cap.release()
-        with self.frame_lock:
-            self.latest_raw_frame = None
-        if self.root.winfo_exists():
-            self.root.after(0, self.status_var.set("جریان ویدئو متوقف شد."))
+        with self.frame_lock: self.latest_raw_frame = None
+        if self.root.winfo_exists(): self.root.after(0, self.status_var.set("جریان ویدئو متوقف شد."))
 
     def start_stream(self):
-        if self.thread and self.thread.is_alive():
-            self.stop_event.set()
-            self.thread.join(timeout=1.0)
-        self.thread = None 
-        self.stop_event.clear()
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_stop_event.set()
-            self.capture_thread.join(timeout=2.0)
-        self.capture_thread = None
-        self.capture_stop_event.clear()
-        with self.frame_lock:
-            self.latest_raw_frame = None
+        if self.thread and self.thread.is_alive(): self.stop_event.set(); self.thread.join(timeout=1.0)
+        self.thread = None; self.stop_event.clear()
+        if self.capture_thread and self.capture_thread.is_alive(): self.capture_stop_event.set(); self.capture_thread.join(timeout=2.0)
+        self.capture_thread = None; self.capture_stop_event.clear()
+        with self.frame_lock: self.latest_raw_frame = None
         self.capture_thread = threading.Thread(target=self._capture_frames_thread, daemon=True)
         self.capture_thread.start()
         self.thread = threading.Thread(target=self.update_video, daemon=True)
         self.thread.start()
-        if self.root.winfo_exists():
-             self.status_var.set("در حال آماده‌سازی جریان ویدئو...")
+        if self.root.winfo_exists(): self.status_var.set("در حال آماده‌سازی جریان ویدئو...")
 
     def stop_stream(self):
         self.capture_stop_event.set()
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=2.0)
+        if self.capture_thread and self.capture_thread.is_alive(): self.capture_thread.join(timeout=2.0)
         self.capture_thread = None
         self.stop_event.set()
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
+        if self.thread and self.thread.is_alive(): self.thread.join(timeout=1.0)
         self.thread = None
         if self.video_writer:
             self.video_writer.release()
@@ -439,7 +600,7 @@ class RTSPViewerApp:
                 self.record_btn.config(text="شروع ضبط")
             self.recording = False
         if self.root.winfo_exists():
-            self.root.after(0, lambda: self.video_label.config(image=''))
+            self.root.after(0, lambda: self.video_label.config(image=self.placeholder_img))  # بازگشت به تصویر اولیه
             if hasattr(self.video_label, 'imgtk'): 
                 self.video_label.imgtk = None
 
@@ -509,19 +670,11 @@ class RTSPViewerApp:
             target_frame_duration = 1.0 / current_frame_rate
             elapsed_since_last_cycle = time.time() - self.last_frame_time
             sleep_needed = max(0, target_frame_duration - elapsed_since_last_cycle)
-            sleep_interval = 0.005
-            num_sleep_intervals = int(sleep_needed / sleep_interval)
-            for _ in range(num_sleep_intervals):
-                if self.stop_event.is_set(): break
-                time.sleep(sleep_interval)
-            if self.stop_event.is_set(): break
-            remaining_sleep = sleep_needed - (num_sleep_intervals * sleep_interval)
-            if remaining_sleep > 0 and not self.stop_event.is_set():
-                 time.sleep(remaining_sleep)
+            time.sleep(sleep_needed)
             self.last_frame_time = time.time()
             if self.stop_event.is_set(): break
         if self.root.winfo_exists():
-            self.root.after(0, lambda: self.video_label.config(image=''))
+            self.root.after(0, lambda: self.video_label.config(image=self.placeholder_img))  # بازگشت به تصویر اولیه
             if hasattr(self.video_label, 'imgtk'):
                 self.video_label.imgtk = None
 
@@ -623,42 +776,16 @@ class RTSPViewerApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    # پوسته اولیه قبل از ایجاد اپلیکیشن و بارگیری تنظیمات اعمال می‌شود
-    initial_theme = "dark" # پیش‌فرض اولیه
     
-    # تلاش برای خواندن پوسته ذخیره شده از فایل تنظیمات، اگر وجود داشته باشد
-    # این کار برای جلوگیری از چشمک زدن پوسته هنگام بارگیری انجام می‌شود
-    # اگر فایل تنظیمات یا پوسته در آن موجود نباشد، از initial_theme استفاده می‌شود
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, 'rb') as f_temp:
-                encrypted_data_temp = f_temp.read()
-            decrypted_data_temp = cipher_suite.decrypt(encrypted_data_temp)
-            temp_settings = json.loads(decrypted_data_temp.decode())
-            initial_theme = temp_settings.get("theme", "dark")
-        except Exception:
-            # در صورت خطا در خواندن فایل تنظیمات، از پوسته پیش‌فرض اولیه استفاده کن
-            pass 
+    # استفاده از تم پیش‌فرض سیستم که معمولاً روشن است
+    style = ttk.Style(root)
+    available_themes = style.theme_names()
+    if "clam" in available_themes: 
+        style.theme_use("clam")
+    else:
+        # اگر تم clam وجود نداشت، از اولین تم موجود استفاده کنید
+        style.theme_use(available_themes[0] if available_themes else "default")
 
-    try:
-        theme_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), THEME_FILE)
-        if os.path.exists(theme_file_path):
-            root.tk.call("source", theme_file_path)
-            root.tk.call("set_theme", initial_theme) # استفاده از پوسته اولیه یا ذخیره شده
-        else:
-            print(f"فایل تم '{THEME_FILE}' در مسیر '{theme_file_path}' یافت نشد. از تم پیش‌فرض استفاده می‌شود.")
-            # در صورت عدم وجود فایل پوسته، می‌توان از پوسته‌های داخلی ttk استفاده کرد
-            style = ttk.Style(root)
-            available_themes = style.theme_names()
-            if "clam" in available_themes: style.theme_use("clam")
-            elif "alt" in available_themes: style.theme_use("alt")
-            elif "default" in available_themes: style.theme_use("default")
-            elif available_themes: style.theme_use(available_themes[0])
-    except tk.TclError as e:
-        print(f"خطای Tcl در هنگام اعمال تم: {e}. از تم پیش‌فرض استفاده می‌شود.")
-    except Exception as e_theme: 
-        print(f"خطای ناشناخته در اعمال تم: {e_theme}. از تم پیش‌فرض استفاده می‌شود.")
-
-    app = RTSPViewerApp(root) # load_settings در داخل __init__ فراخوانی و پوسته را مجددا اعمال می‌کند
+    app = RTSPViewerApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
